@@ -8,7 +8,15 @@
     "bot_user": {
       "display_name": "Clank",
       "always_online": true
-    }
+    },
+    "slash_commands": [
+      {
+        "command": "/new",
+        "description": "Start a fresh Claude session",
+        "usage_hint": " ",
+        "should_escape": false
+      }
+    ]
   },
   "oauth_config": {
     "scopes": {
@@ -36,20 +44,6 @@
     "interactivity": {
       "is_enabled": true
     },
-    "slash_commands": [
-      {
-        "command": "/new",
-        "description": "Start a fresh Claude session",
-        "usage_hint": "",
-        "should_escape": false
-      },
-      {
-        "command": "/status",
-        "description": "Check if Claude is running in this channel",
-        "usage_hint": "",
-        "should_escape": false
-      }
-    ],
     "org_deploy_enabled": false,
     "socket_mode_enabled": true,
     "token_rotation_enabled": false
