@@ -208,6 +208,38 @@ for (const [actionId, decision] of Object.entries(permActionIds)) {
   });
 }
 
+// --- Slash Commands ---
+app.command("/new", async ({ command, ack }) => {
+  await ack();
+  const channelId = command.channel_id;
+  if (!isAllowed(channelId)) return;
+
+  const existing = claudeProcesses.get(channelId);
+  if (existing) {
+    existing.kill();
+    claudeProcesses.delete(channelId);
+  }
+  permissionHandler.clearSessionRules();
+  await app.client.chat.postMessage({
+    channel: channelId,
+    text: "Session cleared. Send a message to start a new one.",
+  });
+});
+
+app.command("/status", async ({ command, ack }) => {
+  await ack();
+  const channelId = command.channel_id;
+  if (!isAllowed(channelId)) return;
+
+  const cp = claudeProcesses.get(channelId);
+  const running = cp?.isRunning ?? false;
+  const sessionId = cp?.getSessionId();
+  const status = running
+    ? `Claude is running (session: \`${sessionId || "unknown"}\`)`
+    : "No active Claude session in this channel.";
+  await app.client.chat.postMessage({ channel: channelId, text: status });
+});
+
 // --- Handle messages ---
 app.message(async ({ message, say }) => {
   // Only handle regular user messages
@@ -219,19 +251,6 @@ app.message(async ({ message, say }) => {
   if (!isAllowed(channelId)) return;
 
   const text = message.text;
-
-  // Handle slash-style commands in message text
-  if (text === "/new" || text === "!new") {
-    const existing = claudeProcesses.get(channelId);
-    if (existing) {
-      existing.kill();
-      claudeProcesses.delete(channelId);
-    }
-    permissionHandler.clearSessionRules();
-    await say("Session cleared. Send a message to start a new one.");
-    return;
-  }
-
   await handleClaudeInteraction(channelId, text, say);
 });
 
