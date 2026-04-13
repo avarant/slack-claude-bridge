@@ -49,8 +49,7 @@ export class ClaudeProcess extends EventEmitter {
       "--output-format",
       "stream-json",
       "--verbose",
-      "--settings",
-      JSON.stringify(settings),
+      "--dangerously-skip-permissions",
     ];
     if (resumeSessionId) {
       args.push("--resume", resumeSessionId);
@@ -65,6 +64,7 @@ export class ClaudeProcess extends EventEmitter {
             ([k]) => !k.startsWith("CLAUDE") || k === "CLAUDE_API_KEY"
           )
         ),
+        CLAUDE_CONFIG_DIR: path.join(process.env.HOME!, ".claude-bridge"),
         SLACK_BRIDGE: "1",
       },
     });

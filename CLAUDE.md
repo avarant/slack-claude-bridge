@@ -49,6 +49,17 @@ Slack ←→ Bolt App (Socket Mode) (index.ts)
 - **`SLACK_BRIDGE`**: Set to `"1"` in the Claude subprocess env so Claude can detect it's running via Slack
 - All other `CLAUDE*` env vars (except `CLAUDE_API_KEY`) are stripped from the subprocess to avoid "nested session" errors
 
+## Systemd Service
+
+Runs as a **user-level** systemd service at `~/.config/systemd/user/slack-claude-bridge.service`. Linger is enabled so it survives logouts and reboots.
+
+```bash
+systemctl --user status slack-claude-bridge   # check status
+systemctl --user restart slack-claude-bridge  # restart
+systemctl --user stop slack-claude-bridge     # stop
+journalctl --user -u slack-claude-bridge -f   # tail logs
+```
+
 ## Config (.env)
 
 - `SLACK_BOT_TOKEN` — Bot token (`xoxb-...`)
