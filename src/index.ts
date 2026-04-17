@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { App } from "@slack/bolt";
+import { slackifyMarkdown } from "slackify-markdown";
 import { ClaudeProcess } from "./claude-process.js";
 import { PermissionHandler, PermissionRequest, PermissionDecision } from "./permission-handler.js";
 
@@ -166,6 +167,18 @@ function sweepIdleThreads(): void {
 }
 
 /**
+ * Convert Claude's CommonMark output to Slack's mrkdwn dialect.
+ * Safe on plain text (no-op-ish for messages without markdown syntax).
+ */
+function toSlackMrkdwn(text: string): string {
+  try {
+    return slackifyMarkdown(text).trimEnd();
+  } catch {
+    return text;
+  }
+}
+
+/**
  * Post a message in a thread.
  */
 function sayInThread(channelId: string, threadTs: string) {
@@ -173,7 +186,7 @@ function sayInThread(channelId: string, threadTs: string) {
     await app.client.chat.postMessage({
       channel: channelId,
       thread_ts: threadTs,
-      text,
+      text: toSlackMrkdwn(text),
     });
   };
 }
@@ -188,6 +201,12 @@ function collectResponse(
 ): Promise<string> {
   return new Promise((resolve) => {
     let finalResult = "";
+    // We stream each `assistant` text block to Slack as it arrives. The final
+    // `result` event's `.result` is usually the same text we already streamed,
+    // so returning it would cause the caller to post a duplicate. Track whether
+    // we streamed anything and suppress the duplicate final-post in the normal
+    // (non-error) case.
+    let streamedText = false;
 
     const onEvent = async (event: Record<string, unknown>) => {
       if (event.type === "assistant") {
@@ -197,6 +216,7 @@ function collectResponse(
         if (msg?.content) {
           for (const block of msg.content) {
             if (block.type === "text" && block.text) {
+              streamedText = true;
               await say(block.text).catch(() => {});
             }
           }
@@ -213,16 +233,22 @@ function collectResponse(
             console.error("[bot] Auth error detected, killing subprocess");
             claude.kill();
           }
+          resolve(finalResult);
         } else {
-          finalResult = (event as Record<string, unknown>).result as string || "";
+          const resultText =
+            ((event as Record<string, unknown>).result as string) || "";
+          resolve(streamedText ? "" : resultText);
         }
-        resolve(finalResult);
       }
     };
 
     const onExit = () => {
       claude.removeListener("event", onEvent);
-      resolve(finalResult || "(Claude process exited unexpectedly)");
+      if (streamedText) {
+        resolve("");
+      } else {
+        resolve(finalResult || "(Claude process exited unexpectedly)");
+      }
     };
 
     claude.on("event", onEvent);
