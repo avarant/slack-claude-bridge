@@ -8,15 +8,7 @@
     "bot_user": {
       "display_name": "Clank",
       "always_online": true
-    },
-    "slash_commands": [
-      {
-        "command": "/new",
-        "description": "Start a fresh Claude session",
-        "usage_hint": " ",
-        "should_escape": false
-      }
-    ]
+    }
   },
   "oauth_config": {
     "scopes": {
@@ -27,8 +19,7 @@
         "channels:history",
         "groups:history",
         "im:history",
-        "mpim:history",
-        "commands"
+        "mpim:history"
       ]
     }
   },

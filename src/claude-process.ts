@@ -27,6 +27,10 @@ export class ClaudeProcess extends EventEmitter {
   spawn(resumeSessionId?: string): void {
     if (this.proc) this.kill();
 
+    // Pre-seed sessionId for resume so the first sendMessage() uses the correct
+    // session_id before the subprocess's init event arrives.
+    this.sessionId = resumeSessionId ?? null;
+
     const repoRoot = path.resolve(
       path.dirname(new URL(import.meta.url).pathname),
       ".."

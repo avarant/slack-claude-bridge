@@ -1,5 +1,7 @@
 import "dotenv/config";
 import { readFile } from "node:fs/promises";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import path from "node:path";
 import { App } from "@slack/bolt";
 import { ClaudeProcess } from "./claude-process.js";
 import { PermissionHandler, PermissionRequest, PermissionDecision } from "./permission-handler.js";
@@ -14,10 +16,64 @@ const ALLOWED_CHANNEL_IDS = new Set(
     .filter(Boolean)
 );
 const PERMISSION_PORT = parseInt(process.env.PERMISSION_PORT || "19276", 10);
+const IDLE_TIMEOUT_MS =
+  parseInt(process.env.IDLE_TIMEOUT_MINUTES || "30", 10) * 60 * 1000;
+const IDLE_SWEEP_MS = 60 * 1000;
+const STATE_FILE_PATH =
+  process.env.BRIDGE_STATE_FILE ||
+  path.join(process.env.HOME || "/tmp", ".slack-claude-bridge-state.json");
 
 // --- State ---
-// Keyed by thread_ts — each thread gets its own Claude subprocess
-const claudeProcesses = new Map<string, ClaudeProcess>();
+// Keyed by thread_ts. We keep the subprocess AND the last-known session_id so
+// that after an idle kill (or a bridge restart) the next message to the thread
+// can transparently `--resume`.
+interface ThreadState {
+  process: ClaudeProcess | null;
+  sessionId: string | null;
+  lastActivityAt: number;
+}
+const threads = new Map<string, ThreadState>();
+
+// On-disk persistence: we survive bridge restarts by writing thread_ts ->
+// sessionId pairs to a JSON file. The `process` field is always null after
+// restart; the idle-resume path will spawn a fresh subprocess on next message.
+function loadPersistedThreads(): void {
+  try {
+    const raw = readFileSync(STATE_FILE_PATH, "utf-8");
+    const data = JSON.parse(raw) as Record<string, string>;
+    for (const [threadTs, sessionId] of Object.entries(data)) {
+      if (typeof sessionId !== "string" || !sessionId) continue;
+      threads.set(threadTs, {
+        process: null,
+        sessionId,
+        lastActivityAt: Date.now(),
+      });
+    }
+    console.log(
+      `[bot] Loaded ${threads.size} thread(s) from ${STATE_FILE_PATH}`
+    );
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      console.log(`[bot] No persisted state at ${STATE_FILE_PATH} (first run)`);
+    } else {
+      console.error(`[bot] Failed to load persisted state:`, err);
+    }
+  }
+}
+
+function persistThreads(): void {
+  const data: Record<string, string> = {};
+  for (const [threadTs, state] of threads) {
+    if (state.sessionId) data[threadTs] = state.sessionId;
+  }
+  try {
+    mkdirSync(path.dirname(STATE_FILE_PATH), { recursive: true });
+    writeFileSync(STATE_FILE_PATH, JSON.stringify(data, null, 2));
+  } catch (err) {
+    console.error(`[bot] Failed to persist state:`, err);
+  }
+}
 // Track which channel+thread is active (for permission requests and image sends)
 let activeThread: { channelId: string; threadTs: string } | null = null;
 const chatLocks = new Map<string, Promise<void>>();
@@ -51,18 +107,62 @@ function isAllowed(channelId: string): boolean {
 }
 
 function getOrSpawnClaude(threadTs: string): ClaudeProcess {
-  let cp = claudeProcesses.get(threadTs);
-  if (cp && cp.isRunning) return cp;
+  let state = threads.get(threadTs);
+  if (!state) {
+    state = { process: null, sessionId: null, lastActivityAt: Date.now() };
+    threads.set(threadTs, state);
+  }
+  state.lastActivityAt = Date.now();
 
-  cp = new ClaudeProcess();
-  claudeProcesses.set(threadTs, cp);
+  if (state.process && state.process.isRunning) return state.process;
 
-  cp.on("exit", () => {
-    console.log(`[bot] Claude process for thread ${threadTs} exited`);
+  const cp = new ClaudeProcess();
+  const s = state;
+  s.process = cp;
+
+  cp.on("event", (event: Record<string, unknown>) => {
+    // Any traffic from Claude keeps the thread active for idle-timeout purposes.
+    s.lastActivityAt = Date.now();
+    if (
+      event.type === "system" &&
+      (event as Record<string, unknown>).subtype === "init" &&
+      event.session_id
+    ) {
+      const newSid = event.session_id as string;
+      if (s.sessionId !== newSid) {
+        s.sessionId = newSid;
+        persistThreads();
+      }
+    }
   });
 
-  cp.spawn();
+  cp.on("exit", () => {
+    const sid = s.sessionId ? ` (sessionId=${s.sessionId})` : "";
+    console.log(`[bot] Claude process for thread ${threadTs} exited${sid}`);
+    // Keep the ThreadState so the next message auto-resumes via --resume.
+    if (s.process === cp) s.process = null;
+  });
+
+  const resumeFrom = s.sessionId ?? undefined;
+  if (resumeFrom) {
+    console.log(`[bot] Resuming thread ${threadTs} from sessionId=${resumeFrom}`);
+  }
+  cp.spawn(resumeFrom);
   return cp;
+}
+
+function sweepIdleThreads(): void {
+  const now = Date.now();
+  for (const [threadTs, state] of threads) {
+    if (!state.process || !state.process.isRunning) continue;
+    if (now - state.lastActivityAt < IDLE_TIMEOUT_MS) continue;
+    const idleMin = Math.round((now - state.lastActivityAt) / 60000);
+    console.log(
+      `[bot] Idle ${idleMin}m — killing process for thread ${threadTs} (sessionId=${state.sessionId}); next message will resume.`
+    );
+    state.process.kill();
+    // The "exit" handler nulls state.process. sessionId is preserved.
+  }
 }
 
 /**
@@ -239,24 +339,6 @@ for (const [actionId, decision] of Object.entries(permActionIds)) {
   });
 }
 
-// --- Slash Commands ---
-app.command("/new", async ({ command, ack }) => {
-  await ack();
-  const channelId = command.channel_id;
-  if (!isAllowed(channelId)) return;
-
-  const existing = claudeProcesses.get(channelId);
-  if (existing) {
-    existing.kill();
-    claudeProcesses.delete(channelId);
-  }
-  permissionHandler.clearSessionRules();
-  await app.client.chat.postMessage({
-    channel: channelId,
-    text: "Session cleared. Send a message to start a new one.",
-  });
-});
-
 // --- Handle messages ---
 app.message(async ({ message }) => {
   if (message.subtype) return;
@@ -270,8 +352,9 @@ app.message(async ({ message }) => {
   const text = message.text;
 
   if (msg.thread_ts) {
-    // Reply in an existing thread — only handle if we have a Claude process for it
-    if (!claudeProcesses.has(msg.thread_ts)) return;
+    // Reply in an existing thread — only handle if it's one of our threads
+    // (process may be idle-killed; resume kicks in when we send the message).
+    if (!threads.has(msg.thread_ts)) return;
     const say = sayInThread(channelId, msg.thread_ts);
     await handleClaudeInteraction(channelId, msg.thread_ts, text, say);
   } else {
@@ -304,8 +387,8 @@ app.event("message", async ({ event }) => {
     const text = (msg.text as string) || "";
     if (!text.includes(`<@${botUserId}>`)) return;
   } else {
-    // In a thread, only handle if we have a Claude process for it
-    if (!claudeProcesses.has(threadTs)) return;
+    // In a thread, only handle if it's one of our threads (may be idle-killed).
+    if (!threads.has(threadTs)) return;
   }
 
   const caption = (msg.text as string) || "Describe this image.";
@@ -378,6 +461,7 @@ async function handleClaudeInteraction(
 
 // --- Start ---
 async function main() {
+  loadPersistedThreads();
   await permissionHandler.start();
 
   permissionHandler.setSendImageHandler(async (imagePath, caption) => {
@@ -397,15 +481,20 @@ async function main() {
     console.log("[bot] sent image to thread", thread.threadTs, ":", imagePath);
   });
 
+  const idleSweep = setInterval(sweepIdleThreads, IDLE_SWEEP_MS);
+  idleSweep.unref();
+
   await app.start();
-  console.log("[bot] Slack bot is running!");
+  console.log(
+    `[bot] Slack bot is running! (idle timeout = ${IDLE_TIMEOUT_MS / 60000}m)`
+  );
 }
 
 process.on("SIGINT", () => {
   console.log("\n[bot] Shutting down...");
   permissionHandler.stop();
-  for (const [, cp] of claudeProcesses) {
-    cp.kill();
+  for (const [, state] of threads) {
+    if (state.process) state.process.kill();
   }
   process.exit(0);
 });
