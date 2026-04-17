@@ -195,17 +195,19 @@ function sayInThread(channelId: string, threadTs: string) {
  * Collect response from Claude, posting intermediate text to the thread.
  * Returns the final result text.
  */
+/**
+ * Drive a request/response cycle and stream assistant text to Slack as it
+ * arrives. Returns:
+ *   - `null` when streaming already handled the response (caller should post nothing)
+ *   - a string when the caller should post it (errors, or edge cases where
+ *     Claude exited without streaming anything)
+ */
 function collectResponse(
   claude: ClaudeProcess,
   say: (text: string) => Promise<unknown>,
-): Promise<string> {
+): Promise<string | null> {
   return new Promise((resolve) => {
     let finalResult = "";
-    // We stream each `assistant` text block to Slack as it arrives. The final
-    // `result` event's `.result` is usually the same text we already streamed,
-    // so returning it would cause the caller to post a duplicate. Track whether
-    // we streamed anything and suppress the duplicate final-post in the normal
-    // (non-error) case.
     let streamedText = false;
 
     const onEvent = async (event: Record<string, unknown>) => {
@@ -237,7 +239,9 @@ function collectResponse(
         } else {
           const resultText =
             ((event as Record<string, unknown>).result as string) || "";
-          resolve(streamedText ? "" : resultText);
+          // If we already streamed assistant text, the result event is a
+          // duplicate of what Slack saw. Signal "nothing to post" with null.
+          resolve(streamedText ? null : resultText);
         }
       }
     };
@@ -245,7 +249,7 @@ function collectResponse(
     const onExit = () => {
       claude.removeListener("event", onEvent);
       if (streamedText) {
-        resolve("");
+        resolve(null);
       } else {
         resolve(finalResult || "(Claude process exited unexpectedly)");
       }
@@ -460,12 +464,14 @@ async function handleClaudeInteraction(
 
       const finalResult = await collectResponse(claude, say);
 
-      // Post the final response
-      if (finalResult) {
-        const maxLen = 3900;
-        if (finalResult.length <= maxLen) {
-          await say(finalResult);
+      // null = streaming already delivered the response; nothing more to post.
+      // String = either an error, a no-stream result, or the exit-fallback
+      // message — post it (chunked if long).
+      if (finalResult !== null) {
+        if (finalResult.length === 0) {
+          await say("(No response from Claude)");
         } else {
+          const maxLen = 3900;
           let remaining = finalResult;
           while (remaining.length > 0) {
             const chunk = remaining.slice(0, maxLen);
@@ -473,8 +479,6 @@ async function handleClaudeInteraction(
             await say(chunk);
           }
         }
-      } else {
-        await say("(No response from Claude)");
       }
     } catch (err) {
       console.error("[bot] Error in Claude interaction:", err);
