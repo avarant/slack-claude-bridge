@@ -191,33 +191,93 @@ function sayInThread(channelId: string, threadTs: string) {
   };
 }
 
-/**
- * Collect response from Claude, posting intermediate text to the thread.
- * Returns the final result text.
- */
-/**
- * Drive a request/response cycle and stream assistant text to Slack as it
- * arrives. Returns:
- *   - `null` when streaming already handled the response (caller should post nothing)
- *   - a string when the caller should post it (errors, or edge cases where
- *     Claude exited without streaming anything)
- */
+interface StatusIndicator {
+  channelId: string;
+  threadTs: string;
+  messageTs: string;
+  statusMsgTs: string | null;
+  eyesAdded: boolean;
+  lastStatus: string;
+}
+
+async function postOrUpdateStatus(
+  indicator: StatusIndicator,
+  status: string,
+): Promise<void> {
+  if (status === indicator.lastStatus) return;
+  indicator.lastStatus = status;
+
+  try {
+    if (indicator.statusMsgTs) {
+      await app.client.chat.update({
+        channel: indicator.channelId,
+        ts: indicator.statusMsgTs,
+        text: status,
+      });
+    } else {
+      const result = await app.client.chat.postMessage({
+        channel: indicator.channelId,
+        thread_ts: indicator.threadTs,
+        text: status,
+      });
+      indicator.statusMsgTs = result.ts ?? null;
+    }
+  } catch {
+    // Best-effort status updates
+  }
+}
+
+async function cleanupStatus(indicator: StatusIndicator): Promise<void> {
+  if (indicator.statusMsgTs) {
+    await app.client.chat.delete({
+      channel: indicator.channelId,
+      ts: indicator.statusMsgTs,
+    }).catch(() => {});
+  }
+  if (indicator.eyesAdded) {
+    await app.client.reactions.remove({
+      channel: indicator.channelId,
+      timestamp: indicator.messageTs,
+      name: "eyes",
+    }).catch(() => {});
+  }
+  await app.client.reactions.add({
+    channel: indicator.channelId,
+    timestamp: indicator.messageTs,
+    name: "white_check_mark",
+  }).catch(() => {});
+}
+
 function collectResponse(
   claude: ClaudeProcess,
   say: (text: string) => Promise<unknown>,
+  indicator: StatusIndicator,
 ): Promise<string | null> {
   return new Promise((resolve) => {
     let finalResult = "";
     let streamedText = false;
 
     const onEvent = async (event: Record<string, unknown>) => {
+      // Add eyes on first event from Claude
+      if (!indicator.eyesAdded) {
+        indicator.eyesAdded = true;
+        app.client.reactions.add({
+          channel: indicator.channelId,
+          timestamp: indicator.messageTs,
+          name: "eyes",
+        }).catch(() => {});
+      }
+
       if (event.type === "assistant") {
         const msg = event.message as {
-          content?: Array<{ type: string; text?: string }>;
+          content?: Array<{ type: string; text?: string; name?: string }>;
         } | undefined;
         if (msg?.content) {
           for (const block of msg.content) {
-            if (block.type === "text" && block.text) {
+            if (block.type === "tool_use" && block.name) {
+              await postOrUpdateStatus(indicator, `:hourglass_flowing_sand: Running \`${block.name}\`…`);
+            } else if (block.type === "text" && block.text) {
+              await postOrUpdateStatus(indicator, `:speech_balloon: Responding…`);
               streamedText = true;
               await say(block.text).catch(() => {});
             }
@@ -226,6 +286,7 @@ function collectResponse(
       } else if (event.type === "result") {
         claude.removeListener("event", onEvent);
         claude.removeListener("exit", onExit);
+        await cleanupStatus(indicator);
         if ((event as Record<string, unknown>).is_error === true) {
           const errText = (event as Record<string, unknown>).error as string ||
                           (event as Record<string, unknown>).result as string ||
@@ -239,15 +300,14 @@ function collectResponse(
         } else {
           const resultText =
             ((event as Record<string, unknown>).result as string) || "";
-          // If we already streamed assistant text, the result event is a
-          // duplicate of what Slack saw. Signal "nothing to post" with null.
           resolve(streamedText ? null : resultText);
         }
       }
     };
 
-    const onExit = () => {
+    const onExit = async () => {
       claude.removeListener("event", onEvent);
+      await cleanupStatus(indicator);
       if (streamedText) {
         resolve(null);
       } else {
@@ -461,16 +521,19 @@ async function handleClaudeInteraction(
   withChatLock(threadTs, async () => {
     activeThread = { channelId, threadTs };
     try {
+      const indicator: StatusIndicator = {
+        channelId,
+        threadTs,
+        messageTs,
+        statusMsgTs: null,
+        eyesAdded: false,
+        lastStatus: "",
+      };
+
       const claude = getOrSpawnClaude(threadTs);
       claude.sendMessage(text, images);
 
-      await app.client.reactions.add({
-        channel: channelId,
-        timestamp: messageTs,
-        name: "eyes",
-      }).catch(() => {});
-
-      const finalResult = await collectResponse(claude, say);
+      const finalResult = await collectResponse(claude, say, indicator);
 
       // null = streaming already delivered the response; nothing more to post.
       // String = either an error, a no-stream result, or the exit-fallback
@@ -488,12 +551,6 @@ async function handleClaudeInteraction(
           }
         }
       }
-
-      await app.client.reactions.add({
-        channel: channelId,
-        timestamp: messageTs,
-        name: "white_check_mark",
-      }).catch(() => {});
     } catch (err) {
       console.error("[bot] Error in Claude interaction:", err);
       await say("Error processing message.").catch(() => {});
