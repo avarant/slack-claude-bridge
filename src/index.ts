@@ -461,14 +461,14 @@ async function handleClaudeInteraction(
   withChatLock(threadTs, async () => {
     activeThread = { channelId, threadTs };
     try {
+      const claude = getOrSpawnClaude(threadTs);
+      claude.sendMessage(text, images);
+
       await app.client.reactions.add({
         channel: channelId,
         timestamp: messageTs,
         name: "eyes",
       }).catch(() => {});
-
-      const claude = getOrSpawnClaude(threadTs);
-      claude.sendMessage(text, images);
 
       const finalResult = await collectResponse(claude, say);
 
