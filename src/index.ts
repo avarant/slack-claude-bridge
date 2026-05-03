@@ -203,36 +203,7 @@ interface StatusIndicator {
   channelId: string;
   threadTs: string;
   messageTs: string;
-  statusMsgTs: string | null;
   eyesAdded: boolean;
-  lastStatus: string;
-}
-
-async function postOrUpdateStatus(
-  indicator: StatusIndicator,
-  status: string,
-): Promise<void> {
-  if (status === indicator.lastStatus) return;
-  indicator.lastStatus = status;
-
-  try {
-    if (indicator.statusMsgTs) {
-      await app.client.chat.update({
-        channel: indicator.channelId,
-        ts: indicator.statusMsgTs,
-        text: status,
-      });
-    } else {
-      const result = await app.client.chat.postMessage({
-        channel: indicator.channelId,
-        thread_ts: indicator.threadTs,
-        text: status,
-      });
-      indicator.statusMsgTs = result.ts ?? null;
-    }
-  } catch {
-    // Best-effort status updates
-  }
 }
 
 async function cleanupStatus(indicator: StatusIndicator): Promise<void> {
@@ -258,7 +229,7 @@ function collectResponse(
     const textBlocks: string[] = [];
 
     const onEvent = async (event: Record<string, unknown>) => {
-      // Add eyes on first event from Claude
+      // Add eyes on first event from Claude — this is our only progress signal.
       if (!indicator.eyesAdded) {
         indicator.eyesAdded = true;
         app.client.reactions.add({
@@ -274,10 +245,7 @@ function collectResponse(
         } | undefined;
         if (msg?.content) {
           for (const block of msg.content) {
-            if (block.type === "tool_use" && block.name) {
-              await postOrUpdateStatus(indicator, `:hourglass_flowing_sand: Running \`${block.name}\`…`);
-            } else if (block.type === "text" && block.text) {
-              await postOrUpdateStatus(indicator, `:speech_balloon: Responding…`);
+            if (block.type === "text" && block.text) {
               textBlocks.push(block.text);
             }
           }
@@ -548,9 +516,7 @@ async function handleClaudeInteraction(
         channelId,
         threadTs,
         messageTs,
-        statusMsgTs: null,
         eyesAdded: false,
-        lastStatus: "",
       };
 
       const claude = getOrSpawnClaude(threadTs);
@@ -560,33 +526,8 @@ async function handleClaudeInteraction(
       const maxLen = 3900;
 
       if (finalResult.length === 0) {
-        if (indicator.statusMsgTs) {
-          await app.client.chat.update({
-            channel: channelId,
-            ts: indicator.statusMsgTs,
-            text: "(No response from Claude)",
-          }).catch(() => {});
-        } else {
-          await say("(No response from Claude)");
-        }
-      } else if (indicator.statusMsgTs) {
-        // Edit the status message to become the response
-        const slackText = toSlackMrkdwn(finalResult);
-        const firstChunk = slackText.slice(0, maxLen);
-        await app.client.chat.update({
-          channel: channelId,
-          ts: indicator.statusMsgTs,
-          text: firstChunk,
-        }).catch(() => {});
-        // Post remaining chunks as new messages
-        let remaining = slackText.slice(maxLen);
-        while (remaining.length > 0) {
-          const chunk = remaining.slice(0, maxLen);
-          remaining = remaining.slice(maxLen);
-          await say(chunk);
-        }
+        await say("(No response from Claude)");
       } else {
-        // No status message was posted, post response as new message(s)
         let remaining = toSlackMrkdwn(finalResult);
         while (remaining.length > 0) {
           const chunk = remaining.slice(0, maxLen);
