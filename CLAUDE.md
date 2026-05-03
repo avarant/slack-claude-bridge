@@ -60,6 +60,42 @@ systemctl --user stop slack-claude-bridge     # stop
 journalctl --user -u slack-claude-bridge -f   # tail logs
 ```
 
+## Deployment on EC2 (Dev)
+
+The bridge runs on the dev/staging EC2 (`i-06141ec8f53774665`) as the `ubuntu` user.
+
+### CRITICAL: Must run as `ubuntu`, NOT root
+
+Claude CLI refuses `--dangerously-skip-permissions` when running as root. SSM `SendCommand` runs as root by default, so starting the bridge via SSM with `nohup node dist/index.js` will appear to work but crash on the first Slack message with:
+```
+--dangerously-skip-permissions cannot be used with root/sudo privileges for security reasons
+```
+
+**Preferred method**: Use the systemd user service (see below). If that's not available, use `sudo -u ubuntu` in SSM commands.
+
+### After git pull / code changes
+
+```bash
+# Must rebuild TypeScript — dist/ is gitignored
+cd /home/ubuntu/slack-claude-bridge
+npx tsc
+
+# Then restart
+systemctl --user restart slack-claude-bridge
+```
+
+### Manual start (if systemd isn't set up)
+
+```bash
+cd /home/ubuntu/slack-claude-bridge
+source .env && export SLACK_BOT_TOKEN SLACK_APP_TOKEN ALLOWED_CHANNEL_IDS PERMISSION_PORT
+nohup node dist/index.js > bridge.log 2>&1 &
+```
+
+### State file
+
+Thread-to-session mappings persist at `~/.slack-claude-bridge-state.json`. The path is based on `$HOME`, so if `HOME` is wrong (e.g. `/root` when running as root via SSM), the bridge won't find existing threads.
+
 ## Config (.env)
 
 - `SLACK_BOT_TOKEN` — Bot token (`xoxb-...`)
