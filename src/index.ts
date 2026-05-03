@@ -20,6 +20,8 @@ const PERMISSION_PORT = parseInt(process.env.PERMISSION_PORT || "19276", 10);
 const IDLE_TIMEOUT_MS =
   parseInt(process.env.IDLE_TIMEOUT_MINUTES || "30", 10) * 60 * 1000;
 const IDLE_SWEEP_MS = 60 * 1000;
+const HEARTBEAT_REACTION = "hourglass_flowing_sand";
+const HEARTBEAT_INTERVAL_MS = 5_000;
 const STATE_FILE_PATH =
   process.env.BRIDGE_STATE_FILE ||
   path.join(process.env.HOME || "/tmp", ".slack-claude-bridge-state.json");
@@ -204,14 +206,67 @@ function sayInThread(channelId: string, threadTs: string) {
   };
 }
 
+interface Heartbeat {
+  timer: NodeJS.Timeout;
+  visible: boolean;
+}
+
 interface StatusIndicator {
   channelId: string;
   threadTs: string;
   messageTs: string;
   eyesAdded: boolean;
+  heartbeat: Heartbeat | null;
+}
+
+// Toggle a reaction on the user's message every HEARTBEAT_INTERVAL_MS to
+// signal "the bridge is still alive" while we wait on Claude. The visible
+// blink is the typing-indicator-equivalent for bots, which Slack does not
+// expose directly outside of the AI Assistant scope.
+function startHeartbeat(indicator: StatusIndicator): void {
+  if (indicator.heartbeat) return;
+  const beat: Heartbeat = { timer: null as unknown as NodeJS.Timeout, visible: false };
+  const tick = async () => {
+    try {
+      if (beat.visible) {
+        await app.client.reactions.remove({
+          channel: indicator.channelId,
+          timestamp: indicator.messageTs,
+          name: HEARTBEAT_REACTION,
+        });
+      } else {
+        await app.client.reactions.add({
+          channel: indicator.channelId,
+          timestamp: indicator.messageTs,
+          name: HEARTBEAT_REACTION,
+        });
+      }
+      beat.visible = !beat.visible;
+    } catch {
+      // Best-effort; reactions may fail if message changed or rate-limited.
+    }
+  };
+  beat.timer = setInterval(tick, HEARTBEAT_INTERVAL_MS);
+  beat.timer.unref?.();
+  indicator.heartbeat = beat;
+}
+
+async function stopHeartbeat(indicator: StatusIndicator): Promise<void> {
+  if (!indicator.heartbeat) return;
+  clearInterval(indicator.heartbeat.timer);
+  const wasVisible = indicator.heartbeat.visible;
+  indicator.heartbeat = null;
+  if (wasVisible) {
+    await app.client.reactions.remove({
+      channel: indicator.channelId,
+      timestamp: indicator.messageTs,
+      name: HEARTBEAT_REACTION,
+    }).catch(() => {});
+  }
 }
 
 async function cleanupStatus(indicator: StatusIndicator): Promise<void> {
+  await stopHeartbeat(indicator);
   if (indicator.eyesAdded) {
     await app.client.reactions.remove({
       channel: indicator.channelId,
@@ -516,14 +571,19 @@ async function handleClaudeInteraction(
 ): Promise<void> {
   withChatLock(threadTs, async () => {
     activeThread = { channelId, threadTs };
+    const indicator: StatusIndicator = {
+      channelId,
+      threadTs,
+      messageTs,
+      eyesAdded: false,
+      heartbeat: null,
+    };
+    // Start the typing-indicator heartbeat immediately — users need a
+    // "the bot is alive" signal even before Claude's first event arrives.
+    // cleanupStatus() (called from collectResponse on result/exit) stops
+    // it; the finally below catches the rare throw-before-collectResponse.
+    startHeartbeat(indicator);
     try {
-      const indicator: StatusIndicator = {
-        channelId,
-        threadTs,
-        messageTs,
-        eyesAdded: false,
-      };
-
       const claude = getOrSpawnClaude(threadTs);
       claude.sendMessage(text, images);
 
@@ -544,6 +604,7 @@ async function handleClaudeInteraction(
       console.error("[bot] Error in Claude interaction:", err);
       await say("Error processing message.").catch(() => {});
     } finally {
+      await stopHeartbeat(indicator);
       activeThread = null;
     }
   });
