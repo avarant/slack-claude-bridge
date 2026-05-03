@@ -39,9 +39,10 @@ Slack ←→ Bolt App (Socket Mode) (index.ts)
 - **Concurrency**: Message handler runs Claude interaction in background so Bolt can process permission button callbacks concurrently. Per-channel lock serializes messages.
 - **Env filtering**: All `CLAUDE*` env vars (except `CLAUDE_API_KEY`) are stripped from subprocess to avoid "nested session" error
 
-## Images
+## Files & Images
 
-- **Slack → Claude**: Files with image mimetypes are downloaded via `url_private_download` (with bot token auth), converted to base64, and passed to Claude
+- **Slack → Claude (images)**: `image/*` mimetypes are downloaded via `url_private_download` (bot token auth), base64-encoded, and passed inline to Claude as `image` content blocks.
+- **Slack → Claude (other files)**: CSVs, PDFs, text, etc. are downloaded once and saved to `${BRIDGE_UPLOADS_DIR:-~/.slack-claude-bridge-uploads}/<thread_ts>/<filename>`. Their absolute paths are appended to the user's caption (as `[Slack upload: file saved to disk at: ...]`) so Claude can `Read` them. Filenames are sanitized; collisions within a thread overwrite. Files are NOT auto-cleaned — the dir grows over time.
 - **Claude → Slack**: Claude runs `src/send-image.sh /path/to/image.png "caption"` which POSTs to the bridge's IPC server (`/send-image` endpoint). The bridge uploads the file via `filesUploadV2`.
 
 ## Environment
@@ -84,6 +85,8 @@ npx tsc
 systemctl --user restart slack-claude-bridge
 ```
 
+**Run `npx tsc` as `ubuntu`, not root.** A root-built `dist/` leaves files owned by root and breaks subsequent `ubuntu`-user rebuilds with `EACCES`. If that happens: `sudo chown -R ubuntu:ubuntu /home/ubuntu/slack-claude-bridge/dist`.
+
 ### Manual start (if systemd isn't set up)
 
 ```bash
@@ -91,6 +94,8 @@ cd /home/ubuntu/slack-claude-bridge
 source .env && export SLACK_BOT_TOKEN SLACK_APP_TOKEN ALLOWED_CHANNEL_IDS PERMISSION_PORT
 nohup node dist/index.js > bridge.log 2>&1 &
 ```
+
+**Don't run nohup-bridge alongside systemd.** The two processes will both try to bind `PERMISSION_PORT` (19276) and the loser hits `EADDRINUSE`. systemd has no visibility into a nohup-spawned bridge, so a `systemctl --user restart` in the presence of a stale nohup process will spin in `auto-restart` forever. Before starting the systemd unit, kill any lingering `node dist/index.js` (find it with `lsof -ti :19276`).
 
 ### State file
 
@@ -102,3 +107,6 @@ Thread-to-session mappings persist at `~/.slack-claude-bridge-state.json`. The p
 - `SLACK_APP_TOKEN` — App-level token for Socket Mode (`xapp-...`)
 - `ALLOWED_CHANNEL_IDS` — Comma-separated list of authorized channel IDs
 - `PERMISSION_PORT` — IPC server port (default: 19276)
+- `BRIDGE_STATE_FILE` — Override path for the thread-to-session JSON (default: `~/.slack-claude-bridge-state.json`)
+- `BRIDGE_UPLOADS_DIR` — Override path where non-image Slack uploads are saved (default: `~/.slack-claude-bridge-uploads/`)
+- `IDLE_TIMEOUT_MINUTES` — Per-thread Claude subprocess idle kill threshold (default: 30)
