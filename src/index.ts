@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { App } from "@slack/bolt";
@@ -23,6 +23,14 @@ const IDLE_SWEEP_MS = 60 * 1000;
 const STATE_FILE_PATH =
   process.env.BRIDGE_STATE_FILE ||
   path.join(process.env.HOME || "/tmp", ".slack-claude-bridge-state.json");
+const UPLOADS_DIR =
+  process.env.BRIDGE_UPLOADS_DIR ||
+  path.join(process.env.HOME || "/tmp", ".slack-claude-bridge-uploads");
+
+function sanitizeFilename(name: string): string {
+  const base = name.replace(/[/\\]/g, "_").replace(/^\.+/, "");
+  return base.length > 0 ? base : "upload";
+}
 
 // --- State ---
 // Keyed by thread_ts. We keep the subprocess AND the last-known session_id so
@@ -447,7 +455,7 @@ app.message(async ({ message }) => {
   }
 });
 
-// --- Handle file uploads (images) ---
+// --- Handle file uploads (images inline, other files saved to disk) ---
 app.event("message", async ({ event }) => {
   const msg = event as unknown as Record<string, unknown>;
   if (msg.subtype !== "file_share") return;
@@ -469,13 +477,12 @@ app.event("message", async ({ event }) => {
     if (!threads.has(threadTs)) return;
   }
 
-  const caption = (msg.text as string) || "Describe this image.";
+  const userText = (msg.text as string) || "";
   const images: Array<{ base64: string; mediaType: string }> = [];
+  const savedFiles: string[] = [];
 
   for (const file of files) {
-    const mimetype = file.mimetype as string || "";
-    if (!mimetype.startsWith("image/")) continue;
-
+    const mimetype = (file.mimetype as string) || "";
     const downloadUrl = file.url_private_download as string;
     if (!downloadUrl) continue;
 
@@ -484,17 +491,45 @@ app.event("message", async ({ event }) => {
         headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
       });
       const buffer = Buffer.from(await res.arrayBuffer());
-      images.push({ base64: buffer.toString("base64"), mediaType: mimetype });
+      if (mimetype.startsWith("image/")) {
+        images.push({ base64: buffer.toString("base64"), mediaType: mimetype });
+      } else {
+        const filename = sanitizeFilename((file.name as string) || "upload");
+        const destDir = path.join(UPLOADS_DIR, threadTs);
+        await mkdir(destDir, { recursive: true });
+        const destPath = path.join(destDir, filename);
+        await writeFile(destPath, buffer);
+        savedFiles.push(destPath);
+        console.log(`[bot] Saved upload (${mimetype || "?"}) -> ${destPath}`);
+      }
     } catch (err) {
       console.error("[bot] Error downloading file:", err);
     }
   }
 
-  if (images.length > 0) {
-    const say = sayInThread(channelId, threadTs);
-    const messageTs = msg.ts as string;
-    await handleClaudeInteraction(channelId, threadTs, messageTs, caption, say, images);
+  if (images.length === 0 && savedFiles.length === 0) return;
+
+  let caption = userText;
+  if (!caption && images.length > 0 && savedFiles.length === 0) {
+    caption = "Describe this image.";
   }
+  if (savedFiles.length > 0) {
+    const list = savedFiles.map((p) => `- ${p}`).join("\n");
+    const noun = savedFiles.length === 1 ? "file" : "files";
+    const note = `[Slack upload: ${noun} saved to disk at:\n${list}]`;
+    caption = caption ? `${caption}\n\n${note}` : note;
+  }
+
+  const say = sayInThread(channelId, threadTs);
+  const messageTs = msg.ts as string;
+  await handleClaudeInteraction(
+    channelId,
+    threadTs,
+    messageTs,
+    caption,
+    say,
+    images.length > 0 ? images : undefined,
+  );
 });
 
 // --- Helper: send message to Claude and post response ---
