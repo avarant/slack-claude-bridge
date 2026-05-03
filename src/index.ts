@@ -228,12 +228,6 @@ async function postOrUpdateStatus(
 }
 
 async function cleanupStatus(indicator: StatusIndicator): Promise<void> {
-  if (indicator.statusMsgTs) {
-    await app.client.chat.delete({
-      channel: indicator.channelId,
-      ts: indicator.statusMsgTs,
-    }).catch(() => {});
-  }
   if (indicator.eyesAdded) {
     await app.client.reactions.remove({
       channel: indicator.channelId,
@@ -250,12 +244,10 @@ async function cleanupStatus(indicator: StatusIndicator): Promise<void> {
 
 function collectResponse(
   claude: ClaudeProcess,
-  say: (text: string) => Promise<unknown>,
   indicator: StatusIndicator,
-): Promise<string | null> {
+): Promise<string> {
   return new Promise((resolve) => {
-    let finalResult = "";
-    let streamedText = false;
+    const textBlocks: string[] = [];
 
     const onEvent = async (event: Record<string, unknown>) => {
       // Add eyes on first event from Claude
@@ -278,8 +270,7 @@ function collectResponse(
               await postOrUpdateStatus(indicator, `:hourglass_flowing_sand: Running \`${block.name}\`…`);
             } else if (block.type === "text" && block.text) {
               await postOrUpdateStatus(indicator, `:speech_balloon: Responding…`);
-              streamedText = true;
-              await say(block.text).catch(() => {});
+              textBlocks.push(block.text);
             }
           }
         }
@@ -291,16 +282,16 @@ function collectResponse(
           const errText = (event as Record<string, unknown>).error as string ||
                           (event as Record<string, unknown>).result as string ||
                           "An error occurred.";
-          finalResult = errText;
           if (errText.includes("authenticate") || errText.includes("401")) {
             console.error("[bot] Auth error detected, killing subprocess");
             claude.kill();
           }
-          resolve(finalResult);
+          resolve(errText);
         } else {
+          const collected = textBlocks.join("\n\n");
           const resultText =
             ((event as Record<string, unknown>).result as string) || "";
-          resolve(streamedText ? null : resultText);
+          resolve(collected || resultText);
         }
       }
     };
@@ -308,11 +299,8 @@ function collectResponse(
     const onExit = async () => {
       claude.removeListener("event", onEvent);
       await cleanupStatus(indicator);
-      if (streamedText) {
-        resolve(null);
-      } else {
-        resolve(finalResult || "(Claude process exited unexpectedly)");
-      }
+      const collected = textBlocks.join("\n\n");
+      resolve(collected || "(Claude process exited unexpectedly)");
     };
 
     claude.on("event", onEvent);
@@ -533,22 +521,42 @@ async function handleClaudeInteraction(
       const claude = getOrSpawnClaude(threadTs);
       claude.sendMessage(text, images);
 
-      const finalResult = await collectResponse(claude, say, indicator);
+      const finalResult = await collectResponse(claude, indicator);
+      const maxLen = 3900;
 
-      // null = streaming already delivered the response; nothing more to post.
-      // String = either an error, a no-stream result, or the exit-fallback
-      // message — post it (chunked if long).
-      if (finalResult !== null) {
-        if (finalResult.length === 0) {
-          await say("(No response from Claude)");
+      if (finalResult.length === 0) {
+        if (indicator.statusMsgTs) {
+          await app.client.chat.update({
+            channel: channelId,
+            ts: indicator.statusMsgTs,
+            text: "(No response from Claude)",
+          }).catch(() => {});
         } else {
-          const maxLen = 3900;
-          let remaining = finalResult;
-          while (remaining.length > 0) {
-            const chunk = remaining.slice(0, maxLen);
-            remaining = remaining.slice(maxLen);
-            await say(chunk);
-          }
+          await say("(No response from Claude)");
+        }
+      } else if (indicator.statusMsgTs) {
+        // Edit the status message to become the response
+        const slackText = toSlackMrkdwn(finalResult);
+        const firstChunk = slackText.slice(0, maxLen);
+        await app.client.chat.update({
+          channel: channelId,
+          ts: indicator.statusMsgTs,
+          text: firstChunk,
+        }).catch(() => {});
+        // Post remaining chunks as new messages
+        let remaining = slackText.slice(maxLen);
+        while (remaining.length > 0) {
+          const chunk = remaining.slice(0, maxLen);
+          remaining = remaining.slice(maxLen);
+          await say(chunk);
+        }
+      } else {
+        // No status message was posted, post response as new message(s)
+        let remaining = toSlackMrkdwn(finalResult);
+        while (remaining.length > 0) {
+          const chunk = remaining.slice(0, maxLen);
+          remaining = remaining.slice(maxLen);
+          await say(chunk);
         }
       }
     } catch (err) {
