@@ -180,7 +180,12 @@ function sweepIdleThreads(): void {
  */
 function toSlackMrkdwn(text: string): string {
   try {
-    return slackifyMarkdown(text).trimEnd();
+    let result = slackifyMarkdown(text).trimEnd();
+    // Collapse <url|url> where href and display text are identical — Slack
+    // auto-links bare URLs, so the redundant link syntax just causes issues
+    // (the | can get URL-encoded to %7C, producing a garbled link).
+    result = result.replace(/<(https?:\/\/[^|>]+)\|\1>/g, "$1");
+    return result;
   } catch {
     return text;
   }
@@ -528,7 +533,7 @@ async function handleClaudeInteraction(
       if (finalResult.length === 0) {
         await say("(No response from Claude)");
       } else {
-        let remaining = toSlackMrkdwn(finalResult);
+        let remaining = finalResult;
         while (remaining.length > 0) {
           const chunk = remaining.slice(0, maxLen);
           remaining = remaining.slice(maxLen);
