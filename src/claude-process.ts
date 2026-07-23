@@ -65,7 +65,10 @@ export class ClaudeProcess extends EventEmitter {
       env: {
         ...Object.fromEntries(
           Object.entries(process.env).filter(
-            ([k]) => !k.startsWith("CLAUDE") || k === "CLAUDE_API_KEY"
+            ([k]) =>
+              !k.startsWith("CLAUDE") ||
+              k === "CLAUDE_API_KEY" ||
+              k === "CLAUDE_CODE_OAUTH_TOKEN"
           )
         ),
         CLAUDE_CONFIG_DIR: path.join(process.env.HOME!, ".claude-bridge"),
