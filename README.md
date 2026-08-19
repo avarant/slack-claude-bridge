@@ -93,6 +93,21 @@ In each channel you want to use, invite the bot:
 | `SLACK_APP_TOKEN` | App-level token from Socket Mode (`xapp-...`) | *(required)* |
 | `ALLOWED_CHANNEL_IDS` | Comma-separated list of authorized channel IDs | *(required)* |
 | `PERMISSION_PORT` | Port for the local permission IPC server | `19276` |
+| `IDLE_TIMEOUT_MINUTES` | Kill idle Claude subprocesses after N minutes (next message auto-resumes) | `30` |
+| `POST_INTERMEDIATE_TEXT` | Post every intermediate assistant text block instead of just the final message | *(off)* |
+
+### `POST_INTERMEDIATE_TEXT`
+
+The reply posted to Slack is the **final** assistant message (the `result`
+event). A long agentic turn also emits a short line of preamble before most
+tool batches ("Now wiring it into the importer."); in a terminal those scroll
+past, but nothing posts to Slack until the turn ends, so they would arrive as a
+wall of retrospective narration in front of the answer.
+
+Set `POST_INTERMEDIATE_TEXT=1` to get the old behaviour — every text block from
+the turn, joined with blank lines. Useful as a diagnostic when you want to see
+what Claude did on the way. On an unexpected subprocess exit there is no result
+event, so the collected blocks are posted either way.
 
 ## Usage
 

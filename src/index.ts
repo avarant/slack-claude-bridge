@@ -20,6 +20,14 @@ const PERMISSION_PORT = parseInt(process.env.PERMISSION_PORT || "19276", 10);
 const IDLE_TIMEOUT_MS =
   parseInt(process.env.IDLE_TIMEOUT_MINUTES || "30", 10) * 60 * 1000;
 const IDLE_SWEEP_MS = 60 * 1000;
+// Post every intermediate assistant text block (inter-tool preamble like
+// "Now wiring it up...") in addition to the final message. Off by default:
+// in Slack nothing posts until the turn ends, so those lines arrive as
+// retrospective narration glued onto the front of the answer. Kept as an
+// opt-in diagnostic.
+const POST_INTERMEDIATE_TEXT = /^(1|true|yes|on)$/i.test(
+  process.env.POST_INTERMEDIATE_TEXT || ""
+);
 const HEARTBEAT_REACTION = "hourglass_flowing_sand";
 const HEARTBEAT_INTERVAL_MS = 5_000;
 const STATE_FILE_PATH =
@@ -327,7 +335,14 @@ function collectResponse(
           const collected = textBlocks.join("\n\n");
           const resultText =
             ((event as Record<string, unknown>).result as string) || "";
-          resolve(collected || resultText);
+          // The `result` event carries the final assistant message. Prefer it:
+          // `collected` also contains every inter-tool preamble line from the
+          // turn, which on a long agentic run buries the answer.
+          resolve(
+            POST_INTERMEDIATE_TEXT
+              ? collected || resultText
+              : resultText || collected
+          );
         }
       }
     };
@@ -335,6 +350,8 @@ function collectResponse(
     const onExit = async () => {
       claude.removeListener("event", onEvent);
       await cleanupStatus(indicator);
+      // No result event on an unexpected exit, so the collected blocks are the
+      // only record of what happened — post them regardless of the flag.
       const collected = textBlocks.join("\n\n");
       resolve(collected || "(Claude process exited unexpectedly)");
     };
