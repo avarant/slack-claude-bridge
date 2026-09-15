@@ -319,6 +319,19 @@ function collectResponse(
           }
         }
       } else if (event.type === "result") {
+        // A resumed session emits a no-op result BEFORE the real turn: the CLI
+        // flushes the background-task notifications orphaned by the idle kill
+        // as a zero-work turn (num_turns 0, duration 0, empty result), then
+        // re-inits and runs the message we actually sent. Resolving on it posts
+        // "(No response from Claude)" and tears down these listeners, so the
+        // real answer arrives with nobody collecting it and is lost outright.
+        if (
+          (event as Record<string, unknown>).num_turns === 0 &&
+          textBlocks.length === 0
+        ) {
+          console.log("[bot] Ignoring no-op result from resumed session");
+          return;
+        }
         claude.removeListener("event", onEvent);
         claude.removeListener("exit", onExit);
         await cleanupStatus(indicator);
