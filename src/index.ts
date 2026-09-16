@@ -591,7 +591,7 @@ app.message(async ({ message }) => {
     // (process may be idle-killed; resume kicks in when we send the message).
     if (!threads.has(msg.thread_ts)) return;
     const say = sayInThread(channelId, msg.thread_ts);
-    await handleClaudeInteraction(channelId, msg.thread_ts, msg.ts, text, say);
+    await handleClaudeInteraction(channelId, msg.thread_ts, text, say);
   } else {
     // Top-level message — only respond if @mentioned
     const botUserId = await getBotUserId();
@@ -600,7 +600,7 @@ app.message(async ({ message }) => {
     // Use this message's ts as the thread
     const threadTs = msg.ts;
     const say = sayInThread(channelId, threadTs);
-    await handleClaudeInteraction(channelId, threadTs, msg.ts, text, say);
+    await handleClaudeInteraction(channelId, threadTs, text, say);
   }
 });
 
@@ -670,11 +670,9 @@ app.event("message", async ({ event }) => {
   }
 
   const say = sayInThread(channelId, threadTs);
-  const messageTs = msg.ts as string;
   await handleClaudeInteraction(
     channelId,
     threadTs,
-    messageTs,
     caption,
     say,
     images.length > 0 ? images : undefined,
@@ -685,7 +683,6 @@ app.event("message", async ({ event }) => {
 async function handleClaudeInteraction(
   channelId: string,
   threadTs: string,
-  messageTs: string,
   text: string,
   say: (msg: string) => Promise<unknown>,
   images?: Array<{ base64: string; mediaType: string }>,
@@ -708,11 +705,6 @@ async function handleClaudeInteraction(
       } else {
         await postChunked(say, finalResult);
       }
-      await app.client.reactions.add({
-        channel: channelId,
-        timestamp: messageTs,
-        name: "white_check_mark",
-      }).catch(() => {});
     } catch (err) {
       console.error("[bot] Error in Claude interaction:", err);
       await say("Error processing message.").catch(() => {});
