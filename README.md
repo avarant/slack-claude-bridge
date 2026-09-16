@@ -4,10 +4,13 @@ A Slack bot that bridges messages to a persistent [Claude Code](https://docs.ant
 
 ## Features
 
-- **Per-channel sessions** — Each allowed channel gets its own persistent Claude subprocess
-- **Interactive permissions** — Tool use prompts via Block Kit buttons (Allow / Session / Always / Deny)
-- **Image support** — Send images to Claude and receive images back
-- **Socket Mode** — No public URL required, runs behind firewalls
+- **Per-thread sessions** — each Slack thread gets its own persistent Claude
+  subprocess, resumed transparently after an idle kill or a bridge restart
+- **Background-task replies** — a turn that finishes after the first answer
+  (background agents, scheduled wakeups) posts into the thread on its own
+- **Working indicator** — Slack's native "<App> is working..." while a turn runs
+- **Image support** — send images to Claude and receive images back
+- **Socket Mode** — no public URL required, runs behind firewalls
 
 ## Prerequisites
 
@@ -43,6 +46,10 @@ Go to **OAuth & Permissions** and add these **Bot Token Scopes**:
 | `im:history` | Read direct messages |
 | `mpim:history` | Read group DMs |
 
+`chat:write` also covers `assistant.threads.setStatus`, which renders the
+"<App> is working..." indicator. No `assistant:write` scope and no AI-App
+configuration are required, and it works in ordinary channel threads.
+
 ### 4. Enable Events
 
 1. Go to **Event Subscriptions** (left sidebar)
@@ -77,6 +84,9 @@ cp .env.example .env
 npm start
 ```
 
+There is no build step — `npm start` runs `tsx src/index.ts` directly. Typecheck
+with `npx tsc --noEmit`.
+
 ### 8. Invite the Bot
 
 In each channel you want to use, invite the bot:
@@ -95,6 +105,11 @@ In each channel you want to use, invite the bot:
 | `PERMISSION_PORT` | Port for the local permission IPC server | `19276` |
 | `IDLE_TIMEOUT_MINUTES` | Kill idle Claude subprocesses after N minutes (next message auto-resumes) | `30` |
 | `POST_INTERMEDIATE_TEXT` | Post every intermediate assistant text block instead of just the final message | *(off)* |
+| `MAX_WORKING_HOURS` | Backstop: reap a "still working" thread that has gone completely silent this long | `4` |
+| `UNPROMPTED_CUTOFF_DAYS` | Only post a background-task reply into a thread a human touched this recently | `7` |
+| `WORKING_STATUS` | Text for the working indicator | `is working...` |
+| `BRIDGE_STATE_FILE` | Path for the thread→session map | `~/.slack-claude-bridge-state.json` |
+| `BRIDGE_UPLOADS_DIR` | Where non-image Slack uploads are saved | `~/.slack-claude-bridge-uploads/` |
 
 ### `POST_INTERMEDIATE_TEXT`
 
@@ -111,17 +126,30 @@ event, so the collected blocks are posted either way.
 
 ## Usage
 
-Send a message in an allowed channel and Claude will respond. The bot processes messages sequentially per channel.
+@mention the bot in an allowed channel to start a thread, then reply in that
+thread to continue. Messages are processed sequentially **per thread**, so two
+threads run concurrently but one thread never overlaps itself.
 
-### Commands
+### Turns and background tasks
 
-Type these as regular messages:
+A single message can produce **more than one turn**. When a background task
+finishes, Claude Code runs another turn in the same subprocess; the bridge posts
+that reply into the thread even though nobody asked for it. Those unprompted
+replies are gated on `UNPROMPTED_CUTOFF_DAYS` so a stranded task cannot
+resurrect a long-dead thread.
 
-| Command | Description |
-|---------|-------------|
-| `!new` | Kill the current Claude session and start fresh |
+Subprocesses are killed after `IDLE_TIMEOUT_MINUTES` of inactivity and resumed
+transparently on the next message. A thread with an outstanding background task
+or a turn in flight is **not** considered idle, however quiet it looks —
+bounded by `MAX_WORKING_HOURS` so a wedged turn cannot pin a subprocess forever.
 
 ### Permissions
+
+> **Not currently active.** The bridge spawns Claude with
+> `--dangerously-skip-permissions`, and `claude-settings.json` is never passed to
+> the CLI (see Architecture), so no PreToolUse hook fires and no prompt is ever
+> posted. The code below still exists and the IPC server is still required for
+> image sending. Wire `--settings` back up in `claude-process.ts` to re-enable it.
 
 When Claude wants to use a tool, the bot posts a permission prompt with four buttons:
 
@@ -138,13 +166,19 @@ Slack ←→ Bolt App (Socket Mode) (index.ts)
        Claude subprocess (claude-process.ts)
           spawned with: claude -p --input-format stream-json
                         --output-format stream-json --verbose
-                        --settings claude-settings.json
+                        --dangerously-skip-permissions
               ↕
        PreToolUse hooks → permission-hook.sh → HTTP POST to IPC server
-              ↕
+              ↕                                  (dormant — see Permissions)
        Permission Handler (permission-handler.ts)
          → Slack Block Kit buttons (Allow/Session/Always/Deny)
+         → also serves /send-image for send-image.sh  (live)
 ```
+
+One collector is registered per subprocess and owns every `result` event,
+handing it to a waiting user turn or posting it unprompted. The subprocess is a
+long-lived stream that can emit several turns per message, so a per-message
+listener would silently drop everything after the first result.
 
 ### Source Files
 
@@ -155,7 +189,7 @@ Slack ←→ Bolt App (Socket Mode) (index.ts)
 | `src/permission-handler.ts` | HTTP IPC server for permission request/response flow |
 | `src/permission-hook.sh` | Shell hook script, forwards PreToolUse events to IPC server |
 | `src/send-image.sh` | Send images to Slack via IPC |
-| `claude-settings.json` | Claude Code settings: hooks config and permission rules |
+| `claude-settings.json` | **Inert.** Parsed and its hook path rewritten in memory, then never passed to the CLI — no `--settings` flag is in the spawn args. |
 
 ## systemd Service
 
