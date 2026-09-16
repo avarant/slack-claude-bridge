@@ -16,7 +16,7 @@ npm start
 Slack ←→ Bolt App (Socket Mode) (index.ts)
               ↕
        Claude subprocess (claude-process.ts)
-          spawned with: claude -p --input-format stream-json --output-format stream-json --verbose --settings claude-settings.json
+          spawned with: claude -p --input-format stream-json --output-format stream-json --verbose --dangerously-skip-permissions
               ↕
        PreToolUse hooks → permission-hook.sh → HTTP POST to IPC server
               ↕
@@ -29,15 +29,54 @@ Slack ←→ Bolt App (Socket Mode) (index.ts)
 - `src/claude-process.ts` — Claude Code subprocess lifecycle, stream-json message protocol
 - `src/permission-handler.ts` — HTTP IPC server on localhost:19276 for permission request/response flow
 - `src/permission-hook.sh` — Shell script called by Claude's PreToolUse hook, forwards to IPC server
-- `claude-settings.json` — Passed via `--settings` flag, configures PreToolUse hooks
+- `claude-settings.json` — **Currently inert.** `claude-process.ts` reads it and
+  rewrites the hook path in memory, but never passes `--settings` to the CLI, and
+  `~/.claude-bridge/settings.json` defines no hooks either. Combined with
+  `--dangerously-skip-permissions`, the PreToolUse → Slack-buttons permission flow
+  described below does not fire in practice. The IPC server still matters — it is
+  what `send-image.sh` posts to.
 
 ### Key Technical Details
 
 - **Stream-JSON input format**: Messages sent as `{"type":"user","session_id":"...","message":{"role":"user","content":"text"},"parent_tool_use_id":null}`
 - **Hooks**: Uses `PreToolUse` (not `PermissionRequest`) — only PreToolUse fires in `-p` headless mode
-- **No streaming**: Responses are collected fully before posting (Slack's streaming APIs require threads)
-- **Concurrency**: Message handler runs Claude interaction in background so Bolt can process permission button callbacks concurrently. Per-channel lock serializes messages.
-- **Env filtering**: All `CLAUDE*` env vars (except `CLAUDE_API_KEY`) are stripped from subprocess to avoid "nested session" error
+- **No streaming**: the reply is collected in full and posted when the turn ends.
+  Progress is signalled by Slack's native working indicator instead (below).
+- **Concurrency**: the message handler runs the Claude interaction in the
+  background so Bolt can process button callbacks concurrently. A **per-thread**
+  lock (`withChatLock(threadTs)`) serializes messages — per thread, not per channel.
+- **Env filtering**: all `CLAUDE*` env vars are stripped from the subprocess to
+  avoid the "nested session" error, except `CLAUDE_API_KEY` and
+  `CLAUDE_CODE_OAUTH_TOKEN`.
+
+## Turns, background tasks, and idle
+
+The subprocess is a long-lived stream that can run **several turns off one user
+message**. When a background task (an `Agent` call, a `/loop` wakeup) finishes,
+Claude Code re-inits in the same process and runs another turn.
+
+- **One collector per subprocess**, registered at spawn in `getOrSpawnClaude` and
+  never removed. It owns every `result` event and either hands it to a waiting
+  user turn (`s.waiter`) or posts it into the thread unprompted. Exactly one
+  owner per result, so nothing is dropped and nothing double-posts. A
+  per-message listener was the previous design and silently lost every
+  post-first-result turn.
+- **A resumed session emits a no-op result first** (`num_turns: 0`,
+  `duration_api_ms: 0`, empty `result`) to flush background-task notifications
+  orphaned by the idle kill, then re-inits and runs the real turn. It is skipped
+  explicitly; treating it as the answer posts "(No response from Claude)" over a
+  turn that has not started.
+- **Unprompted replies are gated** on `UNPROMPTED_CUTOFF_DAYS` (default 7) so a
+  stranded task cannot resurrect a months-old thread.
+- **Idle is not the same as quiet.** Claude's events bump `lastActivityAt`, but a
+  background task emits nothing between `task_started` and its terminal
+  `task_notification`. The sweep therefore skips any thread with outstanding
+  tasks or a turn in flight, bounded by `MAX_WORKING_HOURS` (default 4) so a
+  wedged turn cannot pin a subprocess forever.
+- **Working indicator**: `assistant.threads.setStatus` renders "<App> is
+  working..." in the thread. This needs only `chat:write` — not `assistant:write`
+  — and works in an ordinary channel thread. It replaced an `:eyes:` reaction
+  plus a blinking-hourglass heartbeat. Nothing uses `reactions:write` any more.
 
 ## Files & Images
 
@@ -48,7 +87,8 @@ Slack ←→ Bolt App (Socket Mode) (index.ts)
 ## Environment
 
 - **`SLACK_BRIDGE`**: Set to `"1"` in the Claude subprocess env so Claude can detect it's running via Slack
-- All other `CLAUDE*` env vars (except `CLAUDE_API_KEY`) are stripped from the subprocess to avoid "nested session" errors
+- All other `CLAUDE*` env vars are stripped from the subprocess to avoid "nested
+  session" errors, except `CLAUDE_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN`
 
 ## Systemd Service
 
@@ -76,26 +116,32 @@ Claude CLI refuses `--dangerously-skip-permissions` when running as root. SSM `S
 
 ### After git pull / code changes
 
-```bash
-# Must rebuild TypeScript — dist/ is gitignored
-cd /home/ubuntu/slack-claude-bridge
-npx tsc
+**There is no build step.** The service runs TypeScript directly
+(`node --import tsx src/index.ts`, and `npm start` is `tsx src/index.ts`), so a
+pull plus a restart is the whole deploy:
 
-# Then restart
+```bash
+cd /home/ubuntu/slack-claude-bridge
+git pull --ff-only origin main
 systemctl --user restart slack-claude-bridge
 ```
 
-**Run `npx tsc` as `ubuntu`, not root.** A root-built `dist/` leaves files owned by root and breaks subsequent `ubuntu`-user rebuilds with `EACCES`. If that happens: `sudo chown -R ubuntu:ubuntu /home/ubuntu/slack-claude-bridge/dist`.
+Typecheck before pushing with `npx tsc --noEmit`. Any `dist/` on a box is a
+leftover from the old build-based deploy and is not used by anything.
+
+Restarting is safe for existing conversations — `thread_ts → session_id` is
+persisted, so threads resume. It does kill any turn in flight, and it kills every
+subprocess, which means the next message in any thread is a `--resume`.
 
 ### Manual start (if systemd isn't set up)
 
 ```bash
 cd /home/ubuntu/slack-claude-bridge
 source .env && export SLACK_BOT_TOKEN SLACK_APP_TOKEN ALLOWED_CHANNEL_IDS PERMISSION_PORT
-nohup node dist/index.js > bridge.log 2>&1 &
+nohup npm start > bridge.log 2>&1 &
 ```
 
-**Don't run nohup-bridge alongside systemd.** The two processes will both try to bind `PERMISSION_PORT` (19276) and the loser hits `EADDRINUSE`. systemd has no visibility into a nohup-spawned bridge, so a `systemctl --user restart` in the presence of a stale nohup process will spin in `auto-restart` forever. Before starting the systemd unit, kill any lingering `node dist/index.js` (find it with `lsof -ti :19276`).
+**Don't run nohup-bridge alongside systemd.** Both try to bind `PERMISSION_PORT` (19276) and the loser hits `EADDRINUSE`. systemd has no visibility into a nohup-spawned bridge, so a `systemctl --user restart` with a stale nohup process around will spin in `auto-restart` forever. Kill any lingering process first (`lsof -ti :19276`).
 
 ### State file
 
@@ -109,4 +155,8 @@ Thread-to-session mappings persist at `~/.slack-claude-bridge-state.json`. The p
 - `PERMISSION_PORT` — IPC server port (default: 19276)
 - `BRIDGE_STATE_FILE` — Override path for the thread-to-session JSON (default: `~/.slack-claude-bridge-state.json`)
 - `BRIDGE_UPLOADS_DIR` — Override path where non-image Slack uploads are saved (default: `~/.slack-claude-bridge-uploads/`)
-- `IDLE_TIMEOUT_MINUTES` — Per-thread Claude subprocess idle kill threshold (default: 30)
+- `IDLE_TIMEOUT_MINUTES` — Per-thread subprocess idle kill threshold (default: 30). Only applies to a thread with no outstanding background task and no turn in flight.
+- `MAX_WORKING_HOURS` — Backstop: reap a "still working" thread that has been totally silent this long (default: 4)
+- `UNPROMPTED_CUTOFF_DAYS` — Only post a background-task reply into a thread a human touched this recently (default: 7)
+- `WORKING_STATUS` — Text for Slack's working indicator (default: `is working...`, rendered as "Clank is working...")
+- `POST_INTERMEDIATE_TEXT` — Post every intermediate assistant text block instead of just the final message. Off by default; diagnostic only.
