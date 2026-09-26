@@ -574,6 +574,12 @@ for (const [actionId, decision] of Object.entries(permActionIds)) {
   });
 }
 
+// Claude sees only the text we send it, so say who sent it. The raw Slack user id
+// (not a display name) needs no users:read scope; the deployment's CLAUDE.md maps ids to people.
+function withSender(text: string, user: unknown): string {
+  return typeof user === "string" && user ? `[from <@${user}>] ${text}` : text;
+}
+
 // --- Handle messages ---
 app.message(async ({ message }) => {
   if (message.subtype) return;
@@ -591,7 +597,7 @@ app.message(async ({ message }) => {
     // (process may be idle-killed; resume kicks in when we send the message).
     if (!threads.has(msg.thread_ts)) return;
     const say = sayInThread(channelId, msg.thread_ts);
-    await handleClaudeInteraction(channelId, msg.thread_ts, text, say);
+    await handleClaudeInteraction(channelId, msg.thread_ts, withSender(text, msg.user), say);
   } else {
     // Top-level message — only respond if @mentioned
     const botUserId = await getBotUserId();
@@ -600,7 +606,7 @@ app.message(async ({ message }) => {
     // Use this message's ts as the thread
     const threadTs = msg.ts;
     const say = sayInThread(channelId, threadTs);
-    await handleClaudeInteraction(channelId, threadTs, text, say);
+    await handleClaudeInteraction(channelId, threadTs, withSender(text, msg.user), say);
   }
 });
 
@@ -673,7 +679,7 @@ app.event("message", async ({ event }) => {
   await handleClaudeInteraction(
     channelId,
     threadTs,
-    caption,
+    withSender(caption, msg.user),
     say,
     images.length > 0 ? images : undefined,
   );
