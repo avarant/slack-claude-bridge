@@ -82,7 +82,7 @@ Claude Code re-inits in the same process and runs another turn.
 
 - **Slack → Claude (images)**: `image/*` mimetypes are downloaded via `url_private_download` (bot token auth), base64-encoded, and passed inline to Claude as `image` content blocks.
 - **Slack → Claude (other files)**: CSVs, PDFs, text, etc. are downloaded once and saved to `${BRIDGE_UPLOADS_DIR:-~/.slack-claude-bridge-uploads}/<thread_ts>/<filename>`. Their absolute paths are appended to the user's caption (as `[Slack upload: file saved to disk at: ...]`) so Claude can `Read` them. Filenames are sanitized; collisions within a thread overwrite. Files are NOT auto-cleaned — the dir grows over time.
-- **Claude → Slack**: Claude runs `src/send-image.sh /path/to/image.png "caption"` which POSTs to the bridge's IPC server (`/send-image` endpoint). The bridge uploads the file via `filesUploadV2`.
+- **Claude → Slack**: Claude runs `src/send-image.sh /path/to/image.png "caption"` which POSTs to the bridge's IPC server (`/send-image` endpoint). The bridge uploads the file via `filesUploadV2`. The target thread comes from `BRIDGE_CHANNEL_ID` / `BRIDGE_THREAD_TS`, which the bridge puts in each subprocess's env at spawn — not from the global `activeThread`, which names whichever turn started most recently and used to send files to the wrong thread when turns overlapped. `activeThread` is only a fallback for a caller that sends no target. A non-200 reply (no target, upload failed) makes the script exit 1, so a failed delivery is never reported as `ok`.
 
 ## Environment
 

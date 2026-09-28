@@ -25,7 +25,8 @@ type SendPermissionPrompt = (
 
 export type SendImageHandler = (
   imagePath: string,
-  caption?: string
+  caption?: string,
+  target?: { channelId?: string; threadTs?: string }
 ) => Promise<void>;
 
 export class PermissionHandler {
@@ -206,7 +207,7 @@ export class PermissionHandler {
     req.on("data", (chunk) => (body += chunk));
     req.on("end", async () => {
       try {
-        const { path: imagePath, caption } = JSON.parse(body);
+        const { path: imagePath, caption, channelId, threadTs } = JSON.parse(body);
         if (!imagePath || !fs.existsSync(imagePath)) {
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "File not found: " + imagePath }));
@@ -217,7 +218,10 @@ export class PermissionHandler {
           res.end(JSON.stringify({ error: "No image handler registered" }));
           return;
         }
-        await this.sendImage(imagePath, caption);
+        await this.sendImage(imagePath, caption, {
+          channelId: channelId || undefined,
+          threadTs: threadTs || undefined,
+        });
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
       } catch (err) {
