@@ -10,11 +10,23 @@ export interface ClaudeEvent {
   [key: string]: unknown;
 }
 
+export interface ThreadTarget {
+  channelId: string | null;
+  threadTs: string;
+}
+
 export class ClaudeProcess extends EventEmitter {
   private proc: ChildProcess | null = null;
   private buffer = "";
   private _ready = false;
   private sessionId: string | null = null;
+
+  // The Slack thread this subprocess belongs to. Exported into its env so
+  // send-image.sh can say which thread a file is for, instead of the bridge
+  // guessing from whichever turn is active.
+  constructor(private target?: ThreadTarget) {
+    super();
+  }
 
   get isRunning(): boolean {
     return this.proc !== null && !this.proc.killed;
@@ -73,6 +85,10 @@ export class ClaudeProcess extends EventEmitter {
         ),
         CLAUDE_CONFIG_DIR: path.join(process.env.HOME!, ".claude-bridge"),
         SLACK_BRIDGE: "1",
+        ...(this.target && {
+          BRIDGE_THREAD_TS: this.target.threadTs,
+          ...(this.target.channelId && { BRIDGE_CHANNEL_ID: this.target.channelId }),
+        }),
       },
     });
 

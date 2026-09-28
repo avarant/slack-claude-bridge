@@ -187,7 +187,7 @@ function getOrSpawnClaude(threadTs: string, channelId?: string): ClaudeProcess {
 
   if (state.process && state.process.isRunning) return state.process;
 
-  const cp = new ClaudeProcess();
+  const cp = new ClaudeProcess({ channelId: state.channelId, threadTs });
   const s = state;
   s.process = cp;
 
@@ -728,11 +728,24 @@ async function main() {
   loadPersistedThreads();
   await permissionHandler.start();
 
-  permissionHandler.setSendImageHandler(async (imagePath, caption) => {
-    const thread = activeThread;
+  permissionHandler.setSendImageHandler(async (imagePath, caption, target) => {
+    // Prefer the thread the calling subprocess belongs to (send-image.sh passes
+    // it from BRIDGE_THREAD_TS). activeThread is one global shared by every
+    // thread, so with overlapping turns it names whichever turn started last —
+    // files landed in other people's threads that way. It is only a fallback
+    // for callers that predate the explicit target.
+    let thread: { channelId: string; threadTs: string } | null = null;
+    if (target?.threadTs) {
+      const channelId = target.channelId || threads.get(target.threadTs)?.channelId;
+      if (!channelId) {
+        throw new Error(`Unknown thread ${target.threadTs}: no channel on record`);
+      }
+      thread = { channelId, threadTs: target.threadTs };
+    } else {
+      thread = activeThread;
+    }
     if (!thread) {
-      console.error("[bot] No active thread for image send");
-      return;
+      throw new Error("No target thread for image send (no thread given and no turn active)");
     }
     const fileData = await readFile(imagePath);
     await app.client.filesUploadV2({
