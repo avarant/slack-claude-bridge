@@ -61,8 +61,8 @@ Lookups are cached for an hour (failures for ten minutes) and never delay a
 message by more than two seconds. The `<@ID>` is always present and always last,
 so a CLAUDE.md that maps IDs to people keeps working; display names are self-set,
 so use the ID when identity has to be trusted. **Adding the two `users:*` scopes
-to an existing app requires reinstalling it to the workspace**, which issues a
-new bot token (`SLACK_BOT_TOKEN`); until then the prefix stays ID-only.
+to an existing app requires reinstalling it to the workspace**, which grants the new scopes to the existing bot token (the token itself does not
+change); until then the prefix stays ID-only.
 
 `chat:write` also covers `assistant.threads.setStatus`, which renders the
 "<App> is working..." indicator. No `assistant:write` scope and no AI-App
