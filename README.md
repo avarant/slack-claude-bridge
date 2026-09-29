@@ -45,6 +45,24 @@ Go to **OAuth & Permissions** and add these **Bot Token Scopes**:
 | `groups:history` | Read messages in private channels |
 | `im:history` | Read direct messages |
 | `mpim:history` | Read group DMs |
+| `users:read` | Show Claude the sender's name (optional) |
+| `users:read.email` | Show Claude the sender's email (optional) |
+
+Every message Claude receives starts with who sent it:
+
+```
+[from Jane Doe (jane@example.com) <@U0123ABCD>]   users:read + users:read.email
+[from Jane Doe <@U0123ABCD>]                      users:read only
+[from <@U0123ABCD>]                               neither, or the lookup failed
+```
+
+The name is the sender's Slack display name, falling back to their real name.
+Lookups are cached for an hour (failures for ten minutes) and never delay a
+message by more than two seconds. The `<@ID>` is always present and always last,
+so a CLAUDE.md that maps IDs to people keeps working; display names are self-set,
+so use the ID when identity has to be trusted. **Adding the two `users:*` scopes
+to an existing app requires reinstalling it to the workspace**, which grants the new scopes to the existing bot token (the token itself does not
+change); until then the prefix stays ID-only.
 
 `chat:write` also covers `assistant.threads.setStatus`, which renders the
 "<App> is working..." indicator. No `assistant:write` scope and no AI-App

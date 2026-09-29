@@ -20,7 +20,9 @@
         "channels:history",
         "groups:history",
         "im:history",
-        "mpim:history"
+        "mpim:history",
+        "users:read",
+        "users:read.email"
       ]
     }
   },

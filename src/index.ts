@@ -6,6 +6,7 @@ import { App } from "@slack/bolt";
 import { slackifyMarkdown } from "slackify-markdown";
 import { ClaudeProcess } from "./claude-process.js";
 import { PermissionHandler, PermissionRequest, PermissionDecision } from "./permission-handler.js";
+import { SenderDirectory } from "./sender.js";
 
 // --- Config ---
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN!;
@@ -574,10 +575,22 @@ for (const [actionId, decision] of Object.entries(permActionIds)) {
   });
 }
 
-// Claude sees only the text we send it, so say who sent it. The raw Slack user id
-// (not a display name) needs no users:read scope; the deployment's CLAUDE.md maps ids to people.
-function withSender(text: string, user: unknown): string {
-  return typeof user === "string" && user ? `[from <@${user}>] ${text}` : text;
+// Claude sees only the text we send it, so say who sent it: the sender's Slack
+// name (users:read), email (users:read.email), and always their <@ID>. Without
+// those scopes, or on any lookup failure, the prefix is the ID alone. See
+// src/sender.ts for the exact format.
+const senders = new SenderDirectory(async (userId) => {
+  const res = await app.client.users.info({ user: userId });
+  const profile = res.user?.profile;
+  return {
+    name: profile?.display_name || profile?.real_name || res.user?.real_name,
+    email: profile?.email,
+  };
+});
+
+async function withSender(text: string, user: unknown): Promise<string> {
+  if (typeof user !== "string" || !user) return text;
+  return `${await senders.prefix(user)} ${text}`;
 }
 
 // --- Handle messages ---
@@ -597,7 +610,7 @@ app.message(async ({ message }) => {
     // (process may be idle-killed; resume kicks in when we send the message).
     if (!threads.has(msg.thread_ts)) return;
     const say = sayInThread(channelId, msg.thread_ts);
-    await handleClaudeInteraction(channelId, msg.thread_ts, withSender(text, msg.user), say);
+    await handleClaudeInteraction(channelId, msg.thread_ts, await withSender(text, msg.user), say);
   } else {
     // Top-level message — only respond if @mentioned
     const botUserId = await getBotUserId();
@@ -606,7 +619,7 @@ app.message(async ({ message }) => {
     // Use this message's ts as the thread
     const threadTs = msg.ts;
     const say = sayInThread(channelId, threadTs);
-    await handleClaudeInteraction(channelId, threadTs, withSender(text, msg.user), say);
+    await handleClaudeInteraction(channelId, threadTs, await withSender(text, msg.user), say);
   }
 });
 
@@ -679,7 +692,7 @@ app.event("message", async ({ event }) => {
   await handleClaudeInteraction(
     channelId,
     threadTs,
-    withSender(caption, msg.user),
+    await withSender(caption, msg.user),
     say,
     images.length > 0 ? images : undefined,
   );
